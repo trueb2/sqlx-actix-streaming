@@ -23,9 +23,9 @@ mssql = [ "sqlx/mssql" ]
 actix-web = "4.0.0-beta.3"
 anyhow = "1"
 dotenv = "0"
-env_logger = "0"
+env_tracingger = "0"
 futures = "0"
-log = "0"
+tracing = "0"
 num_cpus = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

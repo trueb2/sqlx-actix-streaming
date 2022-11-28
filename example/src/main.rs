@@ -1,6 +1,6 @@
 use actix_web::*;
 use anyhow::Context;
-use log::*;
+use tracing::*;
 use std::env;
 
 mod widgets;
@@ -11,7 +11,7 @@ type DbPool = sqlx::Pool<Db>;
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
-    env_logger::init();
+    env_tracingger::init();
     let pool = DbPool::connect(&env::var("DATABASE_URL").context("DATABASE_URL")?).await?;
     let pool = web::Data::new(pool); // avoid double Arc.
     let addr = env::var("SOCKETADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());

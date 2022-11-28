@@ -3,8 +3,8 @@ use futures::{
     task::{Context, Poll},
     Stream, TryStream,
 };
-#[cfg(feature = "log")]
-use log::*;
+#[cfg(feature = "tracing")]
+use tracing::*;
 pub use std::io::Write;
 use std::pin::Pin;
 
@@ -67,7 +67,7 @@ where
     delimiter: Vec<u8>,
     suffix: Vec<u8>,
     buf: BytesWriter,
-    #[cfg(feature = "log")]
+    #[cfg(feature = "tracing")]
     item_count: usize,
 }
 
@@ -94,7 +94,7 @@ where
             delimiter: vec![b','],
             suffix: vec![b']'],
             buf: BytesWriter(BytesMut::with_capacity(size)),
-            #[cfg(feature = "log")]
+            #[cfg(feature = "tracing")]
             item_count: 0,
         }
     }
@@ -169,7 +169,7 @@ where
         loop {
             match self.inner_stream.as_mut().try_poll_next(cx) {
                 Ready(Some(Ok(record))) => {
-                    #[cfg(feature = "log")]
+                    #[cfg(feature = "tracing")]
                     {
                         self.item_count += 1;
                     }
@@ -180,7 +180,7 @@ where
                     };
                     let initial_len = self.buf.0.len();
                     if let Err(e) = self.write_item(&record) {
-                        #[cfg(feature = "log")]
+                        #[cfg(feature = "tracing")]
                         error!("failed to write: {:?}", e);
                         break Ready(Some(Err(e)));
                     }
@@ -195,7 +195,7 @@ where
                     break Ready(Some(Ok(self.bytes())));
                 }
                 Ready(Some(Err(e))) => {
-                    #[cfg(feature = "log")]
+                    #[cfg(feature = "tracing")]
                     error!("poll_next: {:?}", e);
                     break Ready(Some(Err(OuterError::from(e))));
                 }
@@ -215,7 +215,7 @@ where
     }
 }
 
-#[cfg(feature = "log")]
+#[cfg(feature = "tracing")]
 impl<InnerStream, InnerError, Serializer, OuterError> Drop
     for ByteStream<InnerStream, InnerError, Serializer, OuterError>
 where
