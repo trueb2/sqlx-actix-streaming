@@ -3,27 +3,42 @@ use futures::{
     task::{Context, Poll},
     Stream, TryStream,
 };
-#[cfg(feature = "tracing")]
-use tracing::*;
 pub use std::io::Write;
-use std::pin::Pin;
+use std::{pin::Pin, marker::PhantomData};
 
-pub struct BytesWriter(pub BytesMut);
-impl BytesWriter {
+pub trait BytesWriter: Write {
+    fn take(&mut self) -> Bytes;
+
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool;
+}
+
+pub struct BufWriter {
+    buf: BytesMut,
+}
+
+impl BytesWriter for BufWriter {
     #[inline]
-    pub fn finish(self) -> BytesMut {
-        self.0
+    fn take(&mut self) -> Bytes {
+        self.buf.split().freeze()
     }
+
     #[inline]
-    pub fn freeze(mut self) -> Bytes {
-        self.0.split().freeze()
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+       self.buf.is_empty() 
     }
 }
 
-impl Write for BytesWriter {
+impl Write for BufWriter {
     #[inline]
     fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
-        self.0.extend_from_slice(src);
+        self.buf.extend_from_slice(src);
         Ok(src.len())
     }
     #[inline]
@@ -49,39 +64,89 @@ pub enum State {
     Done,
 }
 
-const BYTESTREAM_DEFAULT_ITEM_SIZE: usize = 2048;
+pub trait ContentType {
+        /// Set the prefix. For the json array, '[' by default.
+         fn prefix() -> &'static str;
 
-pub struct ByteStream<InnerStream, InnerError, Serializer, OuterError>
+        /// Set the delimiter. For the json array element, ',' by default.
+         fn delimiter() -> &'static str;
+
+        /// Set the suffix. For the json array, ']' by default.
+         fn suffix() -> &'static str;
+}
+
+pub struct JsonArrayContentType;
+impl ContentType for JsonArrayContentType {
+    #[inline]
+    fn prefix() -> &'static str {
+        "["
+    }
+
+    #[inline]
+    fn delimiter() -> &'static str {
+        ","
+    }
+
+    #[inline]
+    fn suffix() -> &'static str {
+        "]"
+    }
+}
+
+pub struct CsvContentType;
+impl ContentType for CsvContentType {
+    #[inline]
+    fn prefix() -> &'static str {
+        ""
+    }
+
+    #[inline]
+    fn delimiter() -> &'static str {
+        ""
+    }
+
+    #[inline]
+    fn suffix() -> &'static str {
+        ""
+    }
+}
+
+
+
+const BYTESTREAM_DEFAULT_ITEM_SIZE: usize = 4096;
+
+pub struct ByteStream<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
 where
     InnerError: std::error::Error,
     InnerStream: TryStream<Error = InnerError>,
     OuterError: From<InnerError> + std::error::Error,
     Serializer:
-        FnMut(&mut BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
+        FnMut(&mut dyn BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
+    SerializerContent: ContentType + Unpin,
 {
     inner_stream: Pin<Box<InnerStream>>,
     serializer: Serializer,
     state: State,
-    item_size: usize,
-    prefix: Vec<u8>,
-    delimiter: Vec<u8>,
-    suffix: Vec<u8>,
-    buf: BytesWriter,
-    #[cfg(feature = "tracing")]
-    item_count: usize,
+    prefix: &'static [u8],
+    delimiter: &'static [u8],
+    suffix: &'static [u8],
+    buf: Box<dyn BytesWriter>,
+    _serializer_content: PhantomData<SerializerContent>,
 }
 
-impl<InnerStream, InnerError, Serializer, OuterError>
-    ByteStream<InnerStream, InnerError, Serializer, OuterError>
+impl<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
+    ByteStream<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
 where
     InnerError: std::error::Error,
     InnerStream: TryStream<Error = InnerError>,
     OuterError: From<InnerError> + std::error::Error,
     Serializer:
-        FnMut(&mut BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
+        FnMut(&mut dyn BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
+    SerializerContent: ContentType + Unpin,
+
 {
     #[inline]
-    pub fn new(inner_stream: InnerStream, serializer: Serializer) -> Self {
+    pub fn new(_content_type: PhantomData<SerializerContent>, inner_stream: InnerStream, serializer: Serializer) -> Self {
         Self::with_size(inner_stream, serializer, BYTESTREAM_DEFAULT_ITEM_SIZE)
     }
     pub fn with_size(inner_stream: InnerStream, serializer: Serializer, size: usize) -> Self {
@@ -89,68 +154,50 @@ where
             inner_stream: Box::pin(inner_stream),
             serializer,
             state: State::Unused,
-            item_size: size,
-            prefix: vec![b'['],
-            delimiter: vec![b','],
-            suffix: vec![b']'],
-            buf: BytesWriter(BytesMut::with_capacity(size)),
-            #[cfg(feature = "tracing")]
-            item_count: 0,
+            prefix: SerializerContent::prefix().as_bytes(),
+            delimiter: SerializerContent::delimiter().as_bytes(),
+            suffix: SerializerContent::suffix().as_bytes(),
+            buf: Box::new(BufWriter { buf: BytesMut::with_capacity(size) }),
+            _serializer_content: PhantomData,
         }
     }
-    /// Set the prefix for the json array. '[' by default.
-    #[inline]
-    pub fn prefix<S: ToString>(mut self, s: S) -> Self {
-        self.prefix = s.to_string().into_bytes();
-        self
-    }
-    /// Set the delimiter for the json array elements. ',' by default.
-    #[inline]
-    pub fn delimiter<S: ToString>(mut self, s: S) -> Self {
-        self.delimiter = s.to_string().into_bytes();
-        self
-    }
-    /// Set the suffix for the json array. ']' by default.
-    #[inline]
-    pub fn suffix<S: ToString>(mut self, s: S) -> Self {
-        self.suffix = s.to_string().into_bytes();
-        self
-    }
+
     // append the configured prefix to the output buffer.
     #[inline]
     fn put_prefix(&mut self) {
-        self.buf.0.extend_from_slice(&self.prefix);
+        let _ = self.buf.write(&self.prefix);
     }
     // append the configured delimiter to the output buffer.
     #[inline]
     fn put_delimiter(&mut self) {
-        self.buf.0.extend_from_slice(&self.delimiter);
+        let _ = self.buf.write(&self.delimiter);
     }
     // append the configured suffix to the output buffer.
     #[inline]
     fn put_suffix(&mut self) {
-        self.buf.0.extend_from_slice(&self.suffix);
+        let _ = self.buf.write(&self.suffix);
     }
     // return the buffered output bytes.
     #[inline]
     fn bytes(&mut self) -> Bytes {
-        self.buf.0.split().freeze()
+        self.buf.take()
     }
     // use the serializer to write one item to the buffer.
     #[inline]
     fn write_item(&mut self, record: &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> {
-        (self.serializer)(&mut self.buf, record)
+        (self.serializer)(&mut *self.buf, record)
     }
 }
 
-impl<InnerStream, InnerError, Serializer, OuterError> Stream
-    for ByteStream<InnerStream, InnerError, Serializer, OuterError>
+impl<InnerStream, InnerError, Serializer, SerializerContent, OuterError> Stream
+    for ByteStream<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
 where
     InnerError: std::error::Error,
     InnerStream: TryStream<Error = InnerError>,
     OuterError: From<InnerError> + std::error::Error,
     Serializer:
-        FnMut(&mut BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
+        FnMut(&mut dyn BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
+    SerializerContent: ContentType + Unpin,
 {
     type Item = Result<Bytes, OuterError>;
 
@@ -169,34 +216,20 @@ where
         loop {
             match self.inner_stream.as_mut().try_poll_next(cx) {
                 Ready(Some(Ok(record))) => {
-                    #[cfg(feature = "tracing")]
-                    {
-                        self.item_count += 1;
-                    }
                     match self.state {
                         Empty => self.state = NonEmpty,
                         NonEmpty => self.put_delimiter(),
                         _ => (),
                     };
-                    let initial_len = self.buf.0.len();
                     if let Err(e) = self.write_item(&record) {
-                        #[cfg(feature = "tracing")]
-                        error!("failed to write: {:?}", e);
                         break Ready(Some(Err(e)));
                     }
-                    let item_size = self.buf.0.len() - initial_len;
-                    if self.item_size < item_size {
-                        self.item_size = item_size.next_power_of_two();
-                    }
-                    let remaining_space = self.buf.0.capacity() - self.buf.0.len();
-                    if item_size <= remaining_space {
+                    if self.buf.len() < BYTESTREAM_DEFAULT_ITEM_SIZE {
                         continue;
                     }
                     break Ready(Some(Ok(self.bytes())));
                 }
                 Ready(Some(Err(e))) => {
-                    #[cfg(feature = "tracing")]
-                    error!("poll_next: {:?}", e);
                     break Ready(Some(Err(OuterError::from(e))));
                 }
                 Ready(None) => {
@@ -205,33 +238,12 @@ where
                     break Ready(Some(Ok(self.bytes())));
                 }
                 Pending => {
-                    if self.buf.0.is_empty() {
+                    if self.buf.is_empty() {
                         break Pending;
                     }
                     break Ready(Some(Ok(self.bytes())));
                 }
             }
-        }
-    }
-}
-
-#[cfg(feature = "tracing")]
-impl<InnerStream, InnerError, Serializer, OuterError> Drop
-    for ByteStream<InnerStream, InnerError, Serializer, OuterError>
-where
-    InnerError: std::error::Error,
-    InnerStream: TryStream<Error = InnerError>,
-    OuterError: From<InnerError> + std::error::Error,
-    Serializer:
-        FnMut(&mut BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
-{
-    #[inline]
-    fn drop(&mut self) {
-        if !matches!(self.state, State::Done) {
-            warn!(
-                "dropped ByteStream in state: {:?} after {} items",
-                self.state, self.item_count
-            );
         }
     }
 }
