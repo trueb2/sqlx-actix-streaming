@@ -1,10 +1,11 @@
 use bytes::{Bytes, BytesMut};
 use futures::{
     task::{Context, Poll},
-    Stream, TryStream,
+    Stream,
 };
+use serde::Serialize;
 pub use std::io::Write;
-use std::{pin::Pin, marker::PhantomData};
+use std::{cell::RefCell, error::Error, pin::Pin, rc::Rc};
 
 pub trait BytesWriter: Write {
     fn take(&mut self) -> Bytes;
@@ -14,31 +15,32 @@ pub trait BytesWriter: Write {
     fn is_empty(&self) -> bool;
 }
 
+#[derive(Clone)]
 pub struct BufWriter {
-    buf: BytesMut,
+    buf: Rc<RefCell<BytesMut>>,
 }
 
 impl BytesWriter for BufWriter {
     #[inline]
     fn take(&mut self) -> Bytes {
-        self.buf.split().freeze()
+        (*self.buf).borrow_mut().split().freeze()
     }
 
     #[inline]
     fn len(&self) -> usize {
-        self.buf.len()
+        self.buf.borrow().len()
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-       self.buf.is_empty() 
+        self.buf.borrow().is_empty()
     }
 }
 
 impl Write for BufWriter {
     #[inline]
     fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(src);
+        (*self.buf).borrow_mut().extend_from_slice(src);
         Ok(src.len())
     }
     #[inline]
@@ -65,141 +67,212 @@ pub enum State {
 }
 
 pub trait ContentType {
-        /// Set the prefix. For the json array, '[' by default.
-         fn prefix() -> &'static str;
+    /// Construct a self with a backing buffer size
+    fn new(size: usize) -> Self;
 
-        /// Set the delimiter. For the json array element, ',' by default.
-         fn delimiter() -> &'static str;
+    /// Set the prefix. For the json array, '[' by default.
+    fn prefix() -> &'static [u8];
 
-        /// Set the suffix. For the json array, ']' by default.
-         fn suffix() -> &'static str;
-}
+    /// Set the delimiter. For the json array element, ',' by default.
+    fn delimiter() -> &'static [u8];
 
-pub struct JsonArrayContentType;
-impl ContentType for JsonArrayContentType {
-    #[inline]
-    fn prefix() -> &'static str {
-        "["
-    }
+    /// Set the suffix. For the json array, ']' by default.
+    fn suffix() -> &'static [u8];
 
-    #[inline]
-    fn delimiter() -> &'static str {
-        ","
-    }
-
-    #[inline]
-    fn suffix() -> &'static str {
-        "]"
-    }
-}
-
-pub struct CsvContentType;
-impl ContentType for CsvContentType {
-    #[inline]
-    fn prefix() -> &'static str {
-        ""
-    }
-
-    #[inline]
-    fn delimiter() -> &'static str {
-        ""
-    }
-
-    #[inline]
-    fn suffix() -> &'static str {
-        ""
-    }
-}
-
-
-
-const BYTESTREAM_DEFAULT_ITEM_SIZE: usize = 4096;
-
-pub struct ByteStream<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
-where
-    InnerError: std::error::Error,
-    InnerStream: TryStream<Error = InnerError>,
-    OuterError: From<InnerError> + std::error::Error,
-    Serializer:
-        FnMut(&mut dyn BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
-    SerializerContent: ContentType + Unpin,
-{
-    inner_stream: Pin<Box<InnerStream>>,
-    serializer: Serializer,
-    state: State,
-    prefix: &'static [u8],
-    delimiter: &'static [u8],
-    suffix: &'static [u8],
-    buf: Box<dyn BytesWriter>,
-    _serializer_content: PhantomData<SerializerContent>,
-}
-
-impl<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
-    ByteStream<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
-where
-    InnerError: std::error::Error,
-    InnerStream: TryStream<Error = InnerError>,
-    OuterError: From<InnerError> + std::error::Error,
-    Serializer:
-        FnMut(&mut dyn BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
-    SerializerContent: ContentType + Unpin,
-
-{
-    #[inline]
-    pub fn new(_content_type: PhantomData<SerializerContent>, inner_stream: InnerStream, serializer: Serializer) -> Self {
-        Self::with_size(inner_stream, serializer, BYTESTREAM_DEFAULT_ITEM_SIZE)
-    }
-    pub fn with_size(inner_stream: InnerStream, serializer: Serializer, size: usize) -> Self {
-        Self {
-            inner_stream: Box::pin(inner_stream),
-            serializer,
-            state: State::Unused,
-            prefix: SerializerContent::prefix().as_bytes(),
-            delimiter: SerializerContent::delimiter().as_bytes(),
-            suffix: SerializerContent::suffix().as_bytes(),
-            buf: Box::new(BufWriter { buf: BytesMut::with_capacity(size) }),
-            _serializer_content: PhantomData,
-        }
-    }
+    /// Get the internal byte buffer writer reference
+    fn buffer(&mut self) -> &mut dyn BytesWriter;
 
     // append the configured prefix to the output buffer.
     #[inline]
     fn put_prefix(&mut self) {
-        let _ = self.buf.write(&self.prefix);
+        let _ = self.buffer().write(Self::prefix());
     }
     // append the configured delimiter to the output buffer.
     #[inline]
     fn put_delimiter(&mut self) {
-        let _ = self.buf.write(&self.delimiter);
+        let _ = self.buffer().write(Self::delimiter());
     }
     // append the configured suffix to the output buffer.
     #[inline]
     fn put_suffix(&mut self) {
-        let _ = self.buf.write(&self.suffix);
+        let _ = self.buffer().write(Self::suffix());
     }
+
+    // Serialize the self and/or the writer
+    fn serialize<T>(&mut self, item: &T) -> Result<(), Box<dyn Error>>
+    where
+        T: Serialize;
+
+    // Flush internals to the writer.
+    fn flush(&mut self, writer: &mut dyn BytesWriter) -> Result<(), Box<dyn Error>>;
+
     // return the buffered output bytes.
     #[inline]
     fn bytes(&mut self) -> Bytes {
-        self.buf.take()
-    }
-    // use the serializer to write one item to the buffer.
-    #[inline]
-    fn write_item(&mut self, record: &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> {
-        (self.serializer)(&mut *self.buf, record)
+        self.buffer().take()
     }
 }
 
-impl<InnerStream, InnerError, Serializer, SerializerContent, OuterError> Stream
-    for ByteStream<InnerStream, InnerError, Serializer, SerializerContent, OuterError>
+pub struct JsonArrayContentType {
+    buf: BufWriter,
+}
+
+impl ContentType for JsonArrayContentType {
+    fn new(size: usize) -> Self {
+        Self {
+            buf: BufWriter {
+                buf: Rc::new(RefCell::new(BytesMut::with_capacity(size))),
+            },
+        }
+    }
+
+    #[inline]
+    fn buffer(&mut self) -> &mut dyn BytesWriter {
+        &mut self.buf
+    }
+
+    #[inline]
+    fn prefix() -> &'static [u8] {
+        "[".as_bytes()
+    }
+
+    #[inline]
+    fn delimiter() -> &'static [u8] {
+        ",".as_bytes()
+    }
+
+    #[inline]
+    fn suffix() -> &'static [u8] {
+        "]".as_bytes()
+    }
+
+    #[inline]
+    fn serialize<T>(&mut self, item: &T) -> Result<(), Box<dyn Error>>
+    where
+        T: Serialize,
+    {
+        serde_json::to_writer(&mut self.buf, item)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self, writer: &mut dyn BytesWriter) -> Result<(), Box<dyn Error>> {
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+pub struct CsvContentType {
+    buf: BufWriter,
+    writer: csv::Writer<BufWriter>,
+}
+
+impl ContentType for CsvContentType {
+    #[inline]
+    fn new(size: usize) -> Self {
+        let buf = BufWriter {
+            buf: Rc::new(RefCell::new(BytesMut::with_capacity(size))),
+        };
+        Self {
+            buf: buf.clone(),
+            writer: csv::Writer::from_writer(buf),
+        }
+    }
+
+    #[inline]
+    fn buffer(&mut self) -> &mut dyn BytesWriter {
+        &mut self.buf
+    }
+
+    #[inline]
+    fn prefix() -> &'static [u8] {
+        "".as_bytes()
+    }
+
+    #[inline]
+    fn delimiter() -> &'static [u8] {
+        "".as_bytes()
+    }
+
+    #[inline]
+    fn suffix() -> &'static [u8] {
+        "".as_bytes()
+    }
+
+    #[inline]
+    fn serialize<T>(&mut self, item: &T) -> Result<(), Box<dyn Error>>
+    where
+        T: Serialize,
+    {
+        self.writer.serialize(item)?;
+        let _ = self.writer.flush()?;
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self, _writer: &mut dyn BytesWriter) -> Result<(), Box<dyn Error>> {
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
+const BYTESTREAM_DEFAULT_ITEM_SIZE: usize = 4096;
+
+pub type CsvStream<'a, InnerStream, InnerT, InnerError> =
+    ByteStream<InnerStream, InnerT, InnerError, CsvContentType>;
+pub type JsonStream<'a, InnerStream, InnerT, InnerError> =
+    ByteStream<InnerStream, InnerT, InnerError, JsonArrayContentType>;
+
+pub struct ByteStream<InnerStream, InnerT, InnerError, ContentTypeWriter>
 where
+    InnerStream: Stream<Item = Result<InnerT, InnerError>>,
     InnerError: std::error::Error,
-    InnerStream: TryStream<Error = InnerError>,
-    OuterError: From<InnerError> + std::error::Error,
-    Serializer:
-        FnMut(&mut dyn BytesWriter, &<InnerStream as TryStream>::Ok) -> Result<(), OuterError> + Unpin,
-    SerializerContent: ContentType + Unpin,
+    InnerT: Serialize,
+    ContentTypeWriter: ContentType + Unpin,
 {
-    type Item = Result<Bytes, OuterError>;
+    inner_stream: Pin<Box<InnerStream>>,
+    state: State,
+    writer: ContentTypeWriter,
+}
+
+impl<InnerStream, InnerT, InnerError, ContentTypeWriter>
+    ByteStream<InnerStream, InnerT, InnerError, ContentTypeWriter>
+where
+    InnerStream: Stream<Item = Result<InnerT, InnerError>>,
+    InnerError: std::error::Error,
+    InnerT: Serialize,
+    ContentTypeWriter: ContentType + Unpin,
+{
+    #[inline]
+    pub fn new(inner_stream: InnerStream) -> Self {
+        Self::with_size(inner_stream, BYTESTREAM_DEFAULT_ITEM_SIZE)
+    }
+
+    pub fn with_size(inner_stream: InnerStream, size: usize) -> Self {
+        ByteStream {
+            inner_stream: Box::pin(inner_stream),
+            state: State::Unused,
+            writer: ContentTypeWriter::new(size),
+        }
+    }
+
+    // use the serializer to write one item to the buffer.
+    #[inline]
+    fn write_item(&mut self, record: InnerT) -> Result<(), Box<dyn Error>> {
+        self.writer.serialize(&record)?;
+        Ok(())
+    }
+}
+
+impl<InnerStream, InnerT, InnerError, SerContentT> Stream
+    for ByteStream<InnerStream, InnerT, InnerError, SerContentT>
+where
+    InnerStream: Stream<Item = Result<InnerT, InnerError>>,
+    InnerError: std::error::Error + 'static,
+    InnerT: Serialize,
+    SerContentT: ContentType + Unpin,
+{
+    type Item = Result<Bytes, Box<dyn Error>>;
 
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -208,40 +281,40 @@ where
         match self.state {
             Unused => {
                 self.state = Empty;
-                self.put_prefix();
+                self.writer.put_prefix();
             }
             Done => return Ready(None),
             _ => (),
         }
         loop {
-            match self.inner_stream.as_mut().try_poll_next(cx) {
-                Ready(Some(Ok(record))) => {
+            match self.inner_stream.as_mut().poll_next(cx) {
+                Ready(Some(record)) => {
+                    let Ok(record) = record else {
+                        break Ready(Some(Err(record.err().unwrap().into())));
+                    };
                     match self.state {
                         Empty => self.state = NonEmpty,
-                        NonEmpty => self.put_delimiter(),
+                        NonEmpty => self.writer.put_delimiter(),
                         _ => (),
                     };
-                    if let Err(e) = self.write_item(&record) {
+                    if let Err(e) = self.write_item(record) {
                         break Ready(Some(Err(e)));
                     }
-                    if self.buf.len() < BYTESTREAM_DEFAULT_ITEM_SIZE {
+                    if self.writer.buffer().len() < BYTESTREAM_DEFAULT_ITEM_SIZE {
                         continue;
                     }
-                    break Ready(Some(Ok(self.bytes())));
-                }
-                Ready(Some(Err(e))) => {
-                    break Ready(Some(Err(OuterError::from(e))));
+                    break Ready(Some(Ok(self.writer.bytes())));
                 }
                 Ready(None) => {
                     self.state = Done;
-                    self.put_suffix();
-                    break Ready(Some(Ok(self.bytes())));
+                    self.writer.put_suffix();
+                    break Ready(Some(Ok(self.writer.bytes())));
                 }
                 Pending => {
-                    if self.buf.is_empty() {
+                    if self.writer.buffer().is_empty() {
                         break Pending;
                     }
-                    break Ready(Some(Ok(self.bytes())));
+                    break Ready(Some(Ok(self.writer.bytes())));
                 }
             }
         }
