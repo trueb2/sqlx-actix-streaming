@@ -5,6 +5,7 @@ use futures::{
 };
 use serde::Serialize;
 pub use std::io::Write;
+use std::fmt::Debug;
 use std::{cell::RefCell, error::Error, pin::Pin, rc::Rc};
 
 pub trait BytesWriter: Write {
@@ -101,7 +102,7 @@ pub trait ContentType {
     // Serialize the self and/or the writer
     fn serialize<T>(&mut self, item: &T) -> Result<(), Box<dyn Error>>
     where
-        T: Serialize;
+        T: Serialize + Debug;
 
     // Flush internals to the writer.
     fn flush(&mut self, writer: &mut dyn BytesWriter) -> Result<(), Box<dyn Error>>;
@@ -149,8 +150,9 @@ impl ContentType for JsonArrayContentType {
     #[inline]
     fn serialize<T>(&mut self, item: &T) -> Result<(), Box<dyn Error>>
     where
-        T: Serialize,
+        T: Serialize + Debug,
     {
+        println!("json: {:?}", item);
         serde_json::to_writer(&mut self.buf, item)?;
         Ok(())
     }
@@ -202,8 +204,9 @@ impl ContentType for CsvContentType {
     #[inline]
     fn serialize<T>(&mut self, item: &T) -> Result<(), Box<dyn Error>>
     where
-        T: Serialize,
+        T: Serialize + Debug,
     {
+        println!("csv: {:?}", item);
         self.writer.serialize(item)?;
         let _ = self.writer.flush()?;
         Ok(())
@@ -240,7 +243,7 @@ impl<InnerStream, InnerT, InnerError, ContentTypeWriter>
 where
     InnerStream: Stream<Item = Result<InnerT, InnerError>>,
     InnerError: std::error::Error,
-    InnerT: Serialize,
+    InnerT: Serialize + Debug,
     ContentTypeWriter: ContentType + Unpin,
 {
     #[inline]
@@ -269,7 +272,7 @@ impl<InnerStream, InnerT, InnerError, SerContentT> Stream
 where
     InnerStream: Stream<Item = Result<InnerT, InnerError>>,
     InnerError: std::error::Error + 'static,
-    InnerT: Serialize,
+    InnerT: Serialize + Debug,
     SerContentT: ContentType + Unpin,
 {
     type Item = Result<Bytes, Box<dyn Error>>;
