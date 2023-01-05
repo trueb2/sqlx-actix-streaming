@@ -216,7 +216,7 @@ impl ContentType for CsvContentType {
     }
 }
 
-const BYTESTREAM_DEFAULT_ITEM_SIZE: usize = 4096;
+const BYTESTREAM_DEFAULT_ITEM_SIZE: usize = 1024;
 
 pub type CsvStream<'a, InnerStream, InnerT, InnerError> =
     ByteStream<InnerStream, InnerT, InnerError, CsvContentType>;
