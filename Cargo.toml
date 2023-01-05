@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [features]
-default = [ "json", "csv" ]
+default = ["json", "csv"]
 json = ["serde_json"]
 
 [dependencies]
@@ -18,3 +18,4 @@ ouroboros = "0.15.5"
 serde = "1.0.148"
 serde_json = { version = "1.0.89", optional = true }
 csv = { version = "1.1.6", optional = true }
+tracing = "0.1.37"
